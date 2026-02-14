@@ -287,6 +287,48 @@ Might be useful e.g. if rqbit upload consumes all your upload bandwidth and inte
             help="Socks5 proxy for outgoing connections. Format: socks5://[username:password@]host:port"
           />
           <FormInput
+            inputType="text"
+            label="[ADVANCED] Bind network interface"
+            name="connections.bind_device_name"
+            value={config.connections.bind_device_name}
+            onChange={handleInputChange}
+            help="Bind DHT, tracker, and peer traffic to a specific interface name (for example utun2 on macOS). Leave empty to use the default route. Not supported on Windows. In this mode SOCKS is disabled, hostname-based tracker/bootstrap URLs are rejected, and UPnP media server must stay disabled."
+          />
+          <FormCheck
+            label="[ADVANCED] Enable VPN lockdown (fail-closed)"
+            name="connections.vpn_lockdown"
+            checked={config.connections.vpn_lockdown}
+            onChange={handleToggleChange}
+            help="Requires Bind network interface above. In this mode rqbit disables SOCKS, UPnP port forwarding and local peer discovery, and stops the session if watchdog checks fail."
+          />
+          <FormInput
+            inputType="text"
+            label="[ADVANCED] Allowed VPN exit CIDRs"
+            name="connections.vpn_allowed_exit_cidrs"
+            value={config.connections.vpn_allowed_exit_cidrs}
+            disabled={!config.connections.vpn_lockdown}
+            onChange={handleInputChange}
+            help="Optional comma-separated public IP ranges allowed for your VPN exit (for example 203.0.113.0/24,198.51.100.0/24)."
+          />
+          <FormInput
+            inputType="text"
+            label="[ADVANCED] VPN exit IP check URL"
+            name="connections.vpn_exit_ip_check_url"
+            value={config.connections.vpn_exit_ip_check_url}
+            disabled={!config.connections.vpn_lockdown}
+            onChange={handleInputChange}
+            help="IP-literal URL that returns your current public IP in plain text (for example http://203.0.113.10/ip). Required if allowed VPN exit CIDRs are set."
+          />
+          <FormInput
+            inputType="number"
+            label="[ADVANCED] VPN check interval (seconds)"
+            name="connections.vpn_check_interval"
+            value={config.connections.vpn_check_interval}
+            disabled={!config.connections.vpn_lockdown}
+            onChange={handleInputChange}
+            help="How often the VPN watchdog verifies interface health and optional exit IP checks."
+          />
+          <FormInput
             inputType="number"
             label="Port"
             name="connections.listen_port"

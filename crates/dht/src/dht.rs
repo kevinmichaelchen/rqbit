@@ -979,10 +979,14 @@ impl DhtWorker {
     }
 
     async fn bootstrap_hostname(&self, hostname: &str) -> crate::Result<()> {
-        let addrs = tokio::net::lookup_host(hostname)
-            .await
-            .map_err(|err| Error::lookup(hostname, err))?
-            .collect::<Vec<_>>();
+        let addrs = if let Ok(addr) = hostname.parse::<SocketAddr>() {
+            vec![addr]
+        } else {
+            tokio::net::lookup_host(hostname)
+                .await
+                .map_err(|err| Error::lookup(hostname, err))?
+                .collect::<Vec<_>>()
+        };
         let v4 = RecursiveRequest::find_node_for_routing_table(
             self.dht.clone(),
             self.dht.id,

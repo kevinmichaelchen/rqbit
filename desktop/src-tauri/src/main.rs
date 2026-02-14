@@ -103,6 +103,20 @@ async fn api_from_config(
         }
     }
 
+    let vpn_lockdown = config.connections.vpn_lockdown;
+    let vpn_allowed_exit_cidrs = if vpn_lockdown {
+        config
+            .connections
+            .vpn_allowed_exit_cidrs
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned)
+            .collect()
+    } else {
+        vec![]
+    };
+
     let session = Session::new_with_opts(
         config.default_download_location.clone(),
         SessionOptions {
@@ -116,6 +130,19 @@ async fn api_from_config(
             connect: Some(connect),
             listen,
             fastresume: config.persistence.fastresume,
+            bind_device_name: {
+                let value = config.connections.bind_device_name.trim();
+                (!value.is_empty()).then(|| value.to_owned())
+            },
+            vpn_lockdown,
+            vpn_allowed_exit_cidrs,
+            vpn_exit_ip_check_url: if vpn_lockdown {
+                let value = config.connections.vpn_exit_ip_check_url.trim();
+                (!value.is_empty()).then(|| value.to_owned())
+            } else {
+                None
+            },
+            vpn_check_interval: vpn_lockdown.then_some(config.connections.vpn_check_interval),
             ratelimits: config.ratelimits,
             #[cfg(feature = "disable-upload")]
             disable_upload: config.disable_upload,

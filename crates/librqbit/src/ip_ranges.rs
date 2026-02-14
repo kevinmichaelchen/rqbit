@@ -59,6 +59,13 @@ impl IpRanges {
     }
 
     pub async fn load_from_url(url: &str) -> Result<Self> {
+        Self::load_from_url_with_client(url, None).await
+    }
+
+    pub async fn load_from_url_with_client(
+        url: &str,
+        reqwest_client: Option<&reqwest::Client>,
+    ) -> Result<Self> {
         let parsed_url = Url::parse(url).context("failed to parse URL")?;
 
         if parsed_url.scheme() == "file" {
@@ -69,9 +76,11 @@ impl IpRanges {
             return Self::load_from_file(path).await;
         }
 
-        let response = reqwest::get(parsed_url)
-            .await
-            .context("error fetching list")?;
+        let response = match reqwest_client {
+            Some(client) => client.get(parsed_url).send().await,
+            None => reqwest::get(parsed_url).await,
+        }
+        .context("error fetching list")?;
         if !response.status().is_success() {
             anyhow::bail!("error fetching list: HTTP {}", response.status());
         }

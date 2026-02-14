@@ -2,7 +2,7 @@ use std::{
     borrow::Cow,
     collections::{HashMap, HashSet},
     io::Read,
-    net::SocketAddr,
+    net::{IpAddr, SocketAddr},
     path::{Component, Path, PathBuf},
     sync::{
         Arc,
@@ -120,6 +120,7 @@ pub struct Session {
     reqwest_client: reqwest::Client,
     udp_tracker_client: UdpTrackerClient,
     disable_trackers: bool,
+    forbid_name_resolution: bool,
 
     // Lifecycle management
     cancellation_token: CancellationToken,
@@ -169,6 +170,138 @@ async fn torrent_from_url(
         .await
         .with_context(|| format!("error reading response body from {url}"))?;
     torrent_from_bytes(b).context("error decoding torrent")
+}
+
+fn ensure_url_uses_ip_literal(url: &str, context: &str) -> anyhow::Result<()> {
+    let parsed =
+        url::Url::parse(url).with_context(|| format!("invalid URL for {context}: {url}"))?;
+    if parsed.scheme() == "file" {
+        return Ok(());
+    }
+    match parsed.host() {
+        Some(url::Host::Ipv4(_) | url::Host::Ipv6(_)) => Ok(()),
+        Some(url::Host::Domain(_)) => {
+            bail!("{context} URL must use an IP literal when bind-device is set: {url}")
+        }
+        None => bail!("{context} URL is missing host: {url}"),
+    }
+}
+
+fn ensure_socket_addrs_are_ip_literals(addrs: &[String], context: &str) -> anyhow::Result<()> {
+    for addr in addrs {
+        if addr.parse::<SocketAddr>().is_err() {
+            bail!("{context} entry must be an IP:port literal when bind-device is set: {addr}");
+        }
+    }
+    Ok(())
+}
+
+#[derive(Clone, Copy, Debug)]
+enum ParsedCidr {
+    V4 { prefix: u8, network: u32 },
+    V6 { prefix: u8, network: u128 },
+}
+
+impl ParsedCidr {
+    fn parse(cidr: &str) -> anyhow::Result<Self> {
+        let (ip, prefix) = cidr
+            .split_once('/')
+            .with_context(|| format!("invalid CIDR {cidr}, expected ip/prefix"))?;
+        let prefix: u8 = prefix
+            .parse()
+            .with_context(|| format!("invalid CIDR prefix in {cidr}"))?;
+        let ip: IpAddr = ip
+            .parse()
+            .with_context(|| format!("invalid CIDR address in {cidr}"))?;
+
+        let parsed = match ip {
+            IpAddr::V4(ip) => {
+                if prefix > 32 {
+                    bail!("invalid IPv4 prefix in {cidr}, expected <= 32");
+                }
+                let mask = if prefix == 0 {
+                    0
+                } else {
+                    u32::MAX << (32 - prefix)
+                };
+                ParsedCidr::V4 {
+                    prefix,
+                    network: ip.to_bits() & mask,
+                }
+            }
+            IpAddr::V6(ip) => {
+                if prefix > 128 {
+                    bail!("invalid IPv6 prefix in {cidr}, expected <= 128");
+                }
+                let mask = if prefix == 0 {
+                    0
+                } else {
+                    u128::MAX << (128 - prefix)
+                };
+                ParsedCidr::V6 {
+                    prefix,
+                    network: ip.to_bits() & mask,
+                }
+            }
+        };
+        Ok(parsed)
+    }
+
+    fn contains(self, ip: IpAddr) -> bool {
+        match (self, ip) {
+            (ParsedCidr::V4 { prefix, network }, IpAddr::V4(ip)) => {
+                let mask = if prefix == 0 {
+                    0
+                } else {
+                    u32::MAX << (32 - prefix)
+                };
+                (ip.to_bits() & mask) == network
+            }
+            (ParsedCidr::V6 { prefix, network }, IpAddr::V6(ip)) => {
+                let mask = if prefix == 0 {
+                    0
+                } else {
+                    u128::MAX << (128 - prefix)
+                };
+                (ip.to_bits() & mask) == network
+            }
+            _ => false,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct VpnWatchdogOptions {
+    bind_device_name: String,
+    check_interval: Duration,
+    allowed_exit_cidrs: Vec<ParsedCidr>,
+    exit_ip_check_url: Option<String>,
+}
+
+fn parse_cidr_list(cidrs: &[String]) -> anyhow::Result<Vec<ParsedCidr>> {
+    cidrs.iter().map(|cidr| ParsedCidr::parse(cidr)).collect()
+}
+
+async fn fetch_public_ip(reqwest_client: &reqwest::Client, url: &str) -> anyhow::Result<IpAddr> {
+    let response = reqwest_client
+        .get(url)
+        .send()
+        .await
+        .with_context(|| format!("error checking VPN exit IP from {url}"))?;
+    if !response.status().is_success() {
+        bail!("VPN exit IP check URL {url} returned {}", response.status());
+    }
+    let body = response
+        .text()
+        .await
+        .with_context(|| format!("error reading VPN exit IP response from {url}"))?;
+    let maybe_ip = body
+        .split_whitespace()
+        .next()
+        .context("empty VPN exit IP response body")?;
+    maybe_ip
+        .parse::<IpAddr>()
+        .with_context(|| format!("cannot parse VPN exit IP from response {maybe_ip:?}"))
 }
 
 fn compute_only_files_regex<ByteBuf: AsRef<[u8]>>(
@@ -404,6 +537,9 @@ pub struct SessionOptions {
 
     /// What network device to bind to for DHT, BT-UDP, BT-TCP, trackers and LSD.
     /// On OSX will use IP(V6)_BOUND_IF, on Linux will use SO_BINDTODEVICE.
+    ///
+    /// When set, rqbit enters stricter mode and rejects hostname-based networking
+    /// paths (requires IP-literal DHT/bootstrap/tracker URLs) and SOCKS proxying.
     pub bind_device_name: Option<String>,
 
     /// Disable tracker communication
@@ -457,6 +593,27 @@ pub struct SessionOptions {
 
     /// Force IPv4 only.
     pub ipv4_only: bool,
+
+    /// Enable fail-closed VPN mode.
+    ///
+    /// Requires bind_device_name to be set. In this mode rqbit:
+    /// - disables SOCKS proxy
+    /// - disables UPnP port forwarding
+    /// - disables local peer discovery (LSD)
+    /// - monitors bound interface health and stops the session on failure
+    pub vpn_lockdown: bool,
+
+    /// Optional list of allowed VPN exit CIDRs (e.g. 203.0.113.0/24).
+    /// If set, rqbit periodically checks public IP via vpn_exit_ip_check_url and
+    /// stops the session if it falls outside these ranges.
+    pub vpn_allowed_exit_cidrs: Vec<String>,
+
+    /// URL that returns the current public IP in plain text.
+    /// Required when vpn_allowed_exit_cidrs is not empty.
+    pub vpn_exit_ip_check_url: Option<String>,
+
+    /// Interval for VPN watchdog checks. Defaults to 30 seconds.
+    pub vpn_check_interval: Option<Duration>,
 }
 
 fn torrent_file_from_info_bytes(info_bytes: &[u8], trackers: &[url::Url]) -> anyhow::Result<Bytes> {
@@ -530,6 +687,121 @@ impl Session {
                         .with_context(|| format!("error creating bind device {name}"))?,
                 ),
                 None => None,
+            };
+            let vpn_lockdown = opts.vpn_lockdown;
+            if !vpn_lockdown {
+                if !opts.vpn_allowed_exit_cidrs.is_empty() {
+                    bail!("--vpn-allowed-exit-cidrs requires --vpn-lockdown");
+                }
+                if opts.vpn_exit_ip_check_url.is_some() {
+                    bail!("--vpn-exit-ip-check-url requires --vpn-lockdown");
+                }
+                if opts.vpn_check_interval.is_some() {
+                    bail!("--vpn-check-interval requires --vpn-lockdown");
+                }
+            }
+
+            if vpn_lockdown {
+                if bind_device.is_none() {
+                    bail!("--vpn-lockdown requires --bind-device");
+                }
+
+                if let Some(proxy_url) = opts
+                    .connect
+                    .as_ref()
+                    .and_then(|connect| connect.proxy_url.as_ref())
+                {
+                    warn!(
+                        proxy_url = %proxy_url,
+                        "vpn lockdown enabled: disabling SOCKS proxy"
+                    );
+                    if let Some(connect) = opts.connect.as_mut() {
+                        connect.proxy_url = None;
+                    }
+                }
+
+                if let Some(listen) = opts.listen.as_mut()
+                    && listen.enable_upnp_port_forwarding
+                {
+                    warn!("vpn lockdown enabled: disabling UPnP port forwarding");
+                    listen.enable_upnp_port_forwarding = false;
+                }
+
+                if !opts.disable_local_service_discovery {
+                    warn!("vpn lockdown enabled: disabling local service discovery");
+                    opts.disable_local_service_discovery = true;
+                }
+
+                if opts.vpn_check_interval.is_some_and(|d| d.is_zero()) {
+                    bail!("--vpn-check-interval must be greater than 0");
+                }
+
+                if !opts.vpn_allowed_exit_cidrs.is_empty() && opts.vpn_exit_ip_check_url.is_none()
+                {
+                    bail!(
+                        "--vpn-allowed-exit-cidrs requires --vpn-exit-ip-check-url (IP-literal URL returning public IP)"
+                    );
+                }
+
+                if opts.vpn_allowed_exit_cidrs.is_empty() && opts.vpn_exit_ip_check_url.is_some() {
+                    bail!("--vpn-exit-ip-check-url requires --vpn-allowed-exit-cidrs");
+                }
+            }
+
+            let forbid_name_resolution = bind_device.is_some();
+
+            if forbid_name_resolution {
+                if opts.connect.as_ref().and_then(|c| c.proxy_url.as_ref()).is_some() {
+                    bail!(
+                        "bind-device cannot be used with SOCKS proxy: outgoing SOCKS socket binding is not guaranteed"
+                    );
+                }
+
+                if !opts.disable_dht {
+                    let addrs = opts.dht_bootstrap_addrs.as_ref().context(
+                        "bind-device requires explicit DHT bootstrap IP:port addresses via --dht-bootstrap-addrs (or disable DHT)",
+                    )?;
+                    ensure_socket_addrs_are_ip_literals(addrs, "DHT bootstrap address")?;
+                }
+
+                if let Some(url) = opts.blocklist_url.as_ref() {
+                    ensure_url_uses_ip_literal(url, "blocklist")?;
+                }
+
+                if let Some(url) = opts.allowlist_url.as_ref() {
+                    ensure_url_uses_ip_literal(url, "allowlist")?;
+                }
+
+                if let Some(url) = opts.vpn_exit_ip_check_url.as_ref() {
+                    ensure_url_uses_ip_literal(url, "VPN exit IP check")?;
+                }
+
+                for tracker in &opts.trackers {
+                    if matches!(tracker.host(), Some(url::Host::Domain(_))) {
+                        bail!(
+                            "global tracker URL must use an IP literal when bind-device is set: {tracker}"
+                        );
+                    }
+                }
+            }
+
+            let vpn_watchdog_opts = if vpn_lockdown {
+                let bind_device_name = opts
+                    .bind_device_name
+                    .as_ref()
+                    .context("bug: vpn lockdown is set but bind-device is missing")?
+                    .to_owned();
+                let check_interval = opts.vpn_check_interval.unwrap_or(Duration::from_secs(30));
+                let allowed_exit_cidrs = parse_cidr_list(&opts.vpn_allowed_exit_cidrs)
+                    .context("error parsing --vpn-allowed-exit-cidrs")?;
+                Some(VpnWatchdogOptions {
+                    bind_device_name,
+                    check_interval,
+                    allowed_exit_cidrs,
+                    exit_ip_check_url: opts.vpn_exit_ip_check_url.clone(),
+                })
+            } else {
+                None
             };
 
             let listen_result = if let Some(listen_opts) = opts.listen.take() {
@@ -640,21 +912,29 @@ impl Session {
             };
 
             let reqwest_client = {
-                let builder = if let Some(proxy_url) = proxy_url {
+                #[allow(unused_mut)]
+                let mut builder = reqwest::Client::builder();
+                if let Some(proxy_url) = proxy_url {
                     let proxy = reqwest::Proxy::all(proxy_url)
                         .context("error creating socks5 proxy for HTTP")?;
-                    reqwest::Client::builder().proxy(proxy)
-                } else {
-                    #[allow(unused_mut)]
-                    let mut b = reqwest::Client::builder();
-                    #[cfg(not(windows))]
-                    if let Some(bd) = opts.bind_device_name.as_ref() {
-                        b = b.interface(bd);
-                    }
-                    b
-                };
+                    builder = builder.proxy(proxy);
+                }
+                #[cfg(not(windows))]
+                if let Some(bd) = opts.bind_device_name.as_ref() {
+                    builder = builder.interface(bd);
+                }
 
                 builder.build().context("error building HTTP(S) client")?
+            };
+
+            let upnp_http_client = {
+                #[allow(unused_mut)]
+                let mut builder = reqwest::Client::builder();
+                #[cfg(not(windows))]
+                if let Some(bd) = opts.bind_device_name.as_ref() {
+                    builder = builder.interface(bd);
+                }
+                builder.build().context("error building UPnP HTTP client")?
             };
 
             let stream_connector = Arc::new(
@@ -671,7 +951,7 @@ impl Session {
 
             let blocklist = if let Some(blocklist_url) = opts.blocklist_url {
                 info!(url = blocklist_url, "loading p2p blocklist");
-                let bl = IpRanges::load_from_url(&blocklist_url)
+                let bl = IpRanges::load_from_url_with_client(&blocklist_url, Some(&reqwest_client))
                     .await
                     .with_context(|| format!("error reading blocklist from {blocklist_url}"))?;
                 info!(len = bl.len(), "loaded blocklist");
@@ -682,7 +962,7 @@ impl Session {
 
             let allowlist = if let Some(allowlist_url) = opts.allowlist_url {
                 info!(url = allowlist_url, "loading p2p allowlist");
-                let al = IpRanges::load_from_url(&allowlist_url)
+                let al = IpRanges::load_from_url_with_client(&allowlist_url, Some(&reqwest_client))
                     .await
                     .with_context(|| format!("error reading allowlist from {allowlist_url}"))?;
                 info!(len = al.len(), "loaded allowlist");
@@ -737,6 +1017,7 @@ impl Session {
                 ipv4_only: opts.ipv4_only,
                 trackers: opts.trackers,
                 disable_trackers: opts.disable_trackers,
+                forbid_name_resolution,
                 peer_limit: opts.peer_limit,
 
                 #[cfg(feature = "disable-upload")]
@@ -745,6 +1026,17 @@ impl Session {
                 allowlist,
                 lsd,
             });
+
+            if let Some(vpn_watchdog_opts) = vpn_watchdog_opts {
+                session.spawn(
+                    debug_span!(parent: session.rs(), "vpn_watchdog"),
+                    "vpn_watchdog",
+                    {
+                        let this = session.clone();
+                        async move { this.task_vpn_watchdog(vpn_watchdog_opts).await }
+                    },
+                );
+            }
 
             if let Some(mut listen) = listen_result {
                 if let Some(tcp) = listen.tcp_socket.take() {
@@ -772,10 +1064,15 @@ impl Session {
                 {
                     info!(port = announce_port, "starting UPnP port forwarder");
                     let bind_device = bind_device.clone();
+                    let upnp_http_client = upnp_http_client.clone();
                     session.spawn(
                         debug_span!(parent: session.rs(), "upnp_forward", port = announce_port),
                         "upnp_forward",
-                        Self::task_upnp_port_forwarder(announce_port, bind_device),
+                        Self::task_upnp_port_forwarder(
+                            announce_port,
+                            bind_device,
+                            upnp_http_client,
+                        ),
                     );
                 }
             }
@@ -933,9 +1230,63 @@ impl Session {
     async fn task_upnp_port_forwarder(
         port: u16,
         bind_device: Option<BindDevice>,
+        http_client: reqwest::Client,
     ) -> anyhow::Result<()> {
-        let pf = librqbit_upnp::UpnpPortForwarder::new(vec![port], None, bind_device)?;
+        let pf = librqbit_upnp::UpnpPortForwarder::new(
+            vec![port],
+            None,
+            bind_device,
+            Some(http_client),
+        )?;
         pf.run_forever().await
+    }
+
+    async fn vpn_lockdown_trip(&self, reason: &str) -> anyhow::Result<()> {
+        error!(reason, "vpn lockdown triggered, stopping session");
+        self.stop().await;
+        bail!("{reason}");
+    }
+
+    async fn task_vpn_watchdog(self: Arc<Self>, opts: VpnWatchdogOptions) -> anyhow::Result<()> {
+        let mut interval = tokio::time::interval(opts.check_interval);
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
+        loop {
+            interval.tick().await;
+
+            if let Err(e) = BindDevice::new_from_name(&opts.bind_device_name) {
+                let reason = format!(
+                    "bound interface {} is not available anymore: {e:#}",
+                    opts.bind_device_name
+                );
+                return self.vpn_lockdown_trip(&reason).await;
+            }
+
+            if !opts.allowed_exit_cidrs.is_empty() {
+                let check_url = opts
+                    .exit_ip_check_url
+                    .as_deref()
+                    .context("bug: exit_ip_check_url is missing")?;
+                let current_ip = match fetch_public_ip(&self.reqwest_client, check_url).await {
+                    Ok(ip) => ip,
+                    Err(e) => {
+                        let reason = format!("failed checking VPN exit IP: {e:#}");
+                        return self.vpn_lockdown_trip(&reason).await;
+                    }
+                };
+
+                let is_allowed = opts
+                    .allowed_exit_cidrs
+                    .iter()
+                    .any(|cidr| cidr.contains(current_ip));
+
+                if !is_allowed {
+                    let reason =
+                        format!("VPN exit IP {current_ip} is outside configured allowed ranges");
+                    return self.vpn_lockdown_trip(&reason).await;
+                }
+            }
+        }
     }
 
     pub fn get_dht(&self) -> Option<&Dht> {
@@ -1039,6 +1390,9 @@ impl Session {
                         AddTorrent::Url(url)
                             if url.starts_with("http://") || url.starts_with("https://") =>
                         {
+                            if self.forbid_name_resolution {
+                                ensure_url_uses_ip_literal(&url, "torrent metadata")?;
+                            }
                             torrent_from_url(&self.reqwest_client, &url).await?
                         }
                         AddTorrent::Url(url) => {
@@ -1494,6 +1848,7 @@ impl Session {
             self.announce_port().unwrap_or(4240),
             self.reqwest_client.clone(),
             self.udp_tracker_client.clone(),
+            !self.forbid_name_resolution,
         );
 
         let initial_peers_rx = if initial_peers.is_empty() {

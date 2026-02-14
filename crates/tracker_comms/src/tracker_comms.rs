@@ -19,6 +19,7 @@ use tracing::debug;
 use tracing::debug_span;
 use tracing::trace;
 use tracing::trace_span;
+use tracing::warn;
 use url::Url;
 
 use crate::tracker_comms_http;
@@ -35,6 +36,7 @@ pub struct TrackerComms {
     // This MUST be set as trackers don't work with 0 port.
     announce_port: u16,
     reqwest_client: reqwest::Client,
+    allow_hostname_resolution: bool,
     key: u32,
 }
 
@@ -105,9 +107,13 @@ enum UdpTrackerResolveResult {
 async fn udp_tracker_to_socket_addrs(
     host: url::Host<&str>,
     port: u16,
+    allow_hostname_resolution: bool,
 ) -> anyhow::Result<UdpTrackerResolveResult> {
     let res = match host {
         url::Host::Domain(name) => {
+            if !allow_hostname_resolution {
+                bail!("tracker hostname resolution is disabled in bind-device mode: {name}:{port}");
+            }
             // Use the first IPv4 and the first IPv6 addresses only.
 
             let mut v4: Option<SocketAddrV4> = None;
@@ -149,15 +155,22 @@ impl TrackerComms {
         announce_port: u16,
         reqwest_client: reqwest::Client,
         udp_client: UdpTrackerClient,
+        allow_hostname_resolution: bool,
     ) -> Option<BoxStream<'static, SocketAddr>> {
         let trackers = trackers
             .into_iter()
-            .filter_map(|t| match t.scheme() {
-                "http" | "https" => Some(SupportedTracker::Http(t)),
-                "udp" => Some(SupportedTracker::Udp(t)),
-                _ => {
-                    debug!("unsupported tracker URL: {}", t);
-                    None
+            .filter_map(|t| {
+                if !allow_hostname_resolution && matches!(t.host(), Some(url::Host::Domain(_))) {
+                    warn!("tracker URL requires hostname resolution, skipping: {}", t);
+                    return None;
+                }
+                match t.scheme() {
+                    "http" | "https" => Some(SupportedTracker::Http(t)),
+                    "udp" => Some(SupportedTracker::Udp(t)),
+                    _ => {
+                        debug!("unsupported tracker URL: {}", t);
+                        None
+                    }
                 }
             })
             .collect::<Vec<_>>();
@@ -180,6 +193,7 @@ impl TrackerComms {
                 tx,
                 announce_port,
                 reqwest_client,
+                allow_hostname_resolution,
                 key: rand::random(),
             });
             let mut futures = FuturesUnordered::new();
@@ -341,7 +355,7 @@ impl TrackerComms {
 
             // This should retry forever until the addrs are resolved.
             let addrs = (async || {
-                udp_tracker_to_socket_addrs(host.clone(), port)
+                udp_tracker_to_socket_addrs(host.clone(), port, self.allow_hostname_resolution)
                     .instrument(trace_span!("resolve", ?host))
                     .await
                     .or_else(|err| prev_addrs.ok_or(err))

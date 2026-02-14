@@ -13,6 +13,11 @@ interface RqbitDesktopConfigConnections {
   enable_tcp_outgoing: boolean;
   enable_utp: boolean;
   enable_upnp_port_forward: boolean;
+  bind_device_name: string;
+  vpn_lockdown: boolean;
+  vpn_allowed_exit_cidrs: string;
+  vpn_exit_ip_check_url: string;
+  vpn_check_interval: Duration;
   socks_proxy: string;
   listen_port: number;
   peer_connect_timeout: Duration;

@@ -78,6 +78,7 @@ pub fn get_local_ip_relative_to(
 }
 
 async fn forward_port(
+    http_client: &Client,
     control_url: Url,
     local_ip: IpAddr,
     port: u16,
@@ -106,8 +107,7 @@ async fn forward_port(
 
     let url = control_url;
 
-    let client = reqwest::Client::new();
-    let response = client
+    let response = http_client
         .post(url.clone())
         .header("Content-Type", "text/xml")
         .header(
@@ -264,8 +264,8 @@ pub struct UpnpDiscoverResponse {
     pub location: Url,
 }
 
-pub async fn discover_services(location: Url) -> anyhow::Result<RootDesc> {
-    let response = Client::new()
+pub async fn discover_services(location: Url, http_client: &Client) -> anyhow::Result<RootDesc> {
+    let response = http_client
         .get(location.clone())
         .send()
         .await
@@ -386,6 +386,7 @@ pub struct UpnpPortForwarder {
     ports: Vec<u16>,
     opts: UpnpPortForwarderOptions,
     bind_device: Option<BindDevice>,
+    http_client: Client,
 }
 
 impl UpnpPortForwarder {
@@ -393,6 +394,7 @@ impl UpnpPortForwarder {
         ports: Vec<u16>,
         opts: Option<UpnpPortForwarderOptions>,
         bind_device: Option<BindDevice>,
+        http_client: Option<Client>,
     ) -> anyhow::Result<Self> {
         if ports.is_empty() {
             bail!("empty ports")
@@ -401,6 +403,7 @@ impl UpnpPortForwarder {
             ports,
             opts: opts.unwrap_or_default(),
             bind_device,
+            http_client: http_client.unwrap_or_else(Client::new),
         })
     }
 
@@ -408,7 +411,19 @@ impl UpnpPortForwarder {
         &self,
         discover_response: UpnpDiscoverResponse,
     ) -> anyhow::Result<UpnpEndpoint> {
-        let services = discover_services(discover_response.location.clone()).await?;
+        if self.bind_device.is_some()
+            && matches!(
+                discover_response.location.host(),
+                Some(url::Host::Domain(_))
+            )
+        {
+            bail!(
+                "UPnP endpoint uses hostname URL while bind-device is enabled: {}",
+                discover_response.location
+            );
+        }
+        let services =
+            discover_services(discover_response.location.clone(), &self.http_client).await?;
         let nics = network_interface::NetworkInterface::show()
             .context("error listing network interfaces")?;
         Ok(UpnpEndpoint {
@@ -450,7 +465,14 @@ impl UpnpPortForwarder {
 
         loop {
             interval.tick().await;
-            if let Err(e) = forward_port(control_url.clone(), local_ip, port, lease_duration).await
+            if let Err(e) = forward_port(
+                &self.http_client,
+                control_url.clone(),
+                local_ip,
+                port,
+                lease_duration,
+            )
+            .await
             {
                 warn!("failed to forward port: {e:#}");
             }

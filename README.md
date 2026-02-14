@@ -73,6 +73,43 @@ eval "$(rqbit completions bash)"
 rqbit --socks-url socks5://[username:password]@host:port ...
 ```
 
+## Bind Traffic To A VPN Interface
+
+To force rqbit traffic through a specific network interface (for example `utun2` on macOS):
+
+```
+rqbit --bind-device utun2 server start ~/Downloads
+```
+
+You can also set `RQBIT_BIND_DEVICE=utun2`.
+
+This binds DHT, trackers, and peer connections to that interface. Not supported on Windows.
+
+When this mode is enabled, rqbit runs in a stricter networking mode:
+- SOCKS proxy is rejected.
+- DHT bootstrap addresses must be IP literals (`--dht-bootstrap-addrs` required if DHT is enabled).
+- Tracker/blocklist/allowlist/torrent HTTP URLs must use IP-literal hosts (no DNS hostnames).
+- UPnP media server mode (`--enable-upnp-server`) is rejected.
+
+For a fail-closed setup, enable VPN lockdown:
+
+```
+rqbit \
+  --bind-device utun2 \
+  --vpn-lockdown \
+  --vpn-allowed-exit-cidrs 203.0.113.0/24 \
+  --vpn-exit-ip-check-url http://203.0.113.10/ip \
+  server start ~/Downloads
+```
+
+With `--vpn-lockdown`, rqbit:
+- disables SOCKS proxy automatically
+- disables UPnP port forwarding automatically
+- disables local peer discovery automatically
+- continuously checks that the bound interface still exists
+- optionally checks that the observed public IP is within `--vpn-allowed-exit-cidrs`
+- stops the whole session immediately if any check fails
+
 ## Watching a directory for .torrents
 
 ```

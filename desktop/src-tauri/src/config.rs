@@ -37,8 +37,14 @@ pub struct RqbitDesktopConfigConnections {
     pub enable_tcp_outgoing: bool,
     pub enable_utp: bool,
     pub enable_upnp_port_forward: bool,
+    pub bind_device_name: String,
+    pub vpn_lockdown: bool,
+    pub vpn_allowed_exit_cidrs: String,
+    pub vpn_exit_ip_check_url: String,
     pub socks_proxy: String,
     pub listen_port: u16,
+    #[serde_as(as = "serde_with::DurationSeconds")]
+    pub vpn_check_interval: Duration,
 
     #[serde_as(as = "serde_with::DurationSeconds")]
     pub peer_connect_timeout: Duration,
@@ -84,8 +90,13 @@ impl Default for RqbitDesktopConfigConnections {
             enable_tcp_outgoing: true,
             enable_utp: false,
             enable_upnp_port_forward: true,
+            bind_device_name: String::new(),
+            vpn_lockdown: false,
+            vpn_allowed_exit_cidrs: String::new(),
+            vpn_exit_ip_check_url: String::new(),
             listen_port: 4240,
             socks_proxy: String::new(),
+            vpn_check_interval: Duration::from_secs(30),
             peer_connect_timeout: Duration::from_secs(2),
             peer_read_write_timeout: Duration::from_secs(10),
         }
@@ -205,6 +216,43 @@ impl Default for RqbitDesktopConfig {
 
 impl RqbitDesktopConfig {
     pub fn validate(&self) -> anyhow::Result<()> {
+        let has_bind_device = !self.connections.bind_device_name.trim().is_empty();
+        if self.upnp.enable_server && has_bind_device {
+            anyhow::bail!(
+                "UPnP media server is incompatible with bind-device mode. Disable one of them."
+            )
+        }
+
+        let has_vpn_allowed_exit_cidrs = self
+            .connections
+            .vpn_allowed_exit_cidrs
+            .split(',')
+            .any(|v| !v.trim().is_empty());
+        let has_vpn_exit_ip_check_url = !self.connections.vpn_exit_ip_check_url.trim().is_empty();
+
+        if self.connections.vpn_lockdown {
+            if !has_bind_device {
+                anyhow::bail!(
+                    "VPN lockdown requires bind-device interface name (for example utun2)."
+                )
+            }
+            if self.connections.vpn_check_interval.is_zero() {
+                anyhow::bail!("VPN check interval must be greater than 0 seconds.")
+            }
+            if has_vpn_allowed_exit_cidrs && !has_vpn_exit_ip_check_url {
+                anyhow::bail!(
+                    "VPN allowed exit CIDRs require a VPN exit IP check URL (IP-literal URL returning public IP)."
+                )
+            }
+            if !has_vpn_allowed_exit_cidrs && has_vpn_exit_ip_check_url {
+                anyhow::bail!("VPN exit IP check URL requires VPN allowed exit CIDRs.")
+            }
+        } else if has_vpn_allowed_exit_cidrs || has_vpn_exit_ip_check_url {
+            anyhow::bail!(
+                "VPN allowed exit CIDRs and VPN exit IP check URL require VPN lockdown to be enabled."
+            )
+        }
+
         if self.upnp.enable_server {
             if self.http_api.disable {
                 anyhow::bail!("if UPnP server is enabled, you need to enable the HTTP API also.")

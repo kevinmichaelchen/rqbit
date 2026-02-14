@@ -195,9 +195,42 @@ struct Opts {
     /// What network device to bind to for DHT, BT-UDP, BT-TCP, trackers and LSD.
     /// On OSX will use IP(V6)_BOUND_IF, on Linux will use SO_BINDTODEVICE.
     ///
+    /// In bind-device mode, rqbit disables hostname resolution for torrent-related
+    /// network paths, so hostnames in DHT bootstrap/tracker URLs are rejected.
+    /// Use IP literals instead.
+    ///
+    /// SOCKS proxy mode is incompatible with this setting.
+    ///
     /// Not supported on Windows (will error if you try to use it).
     #[arg(long = "bind-device", env = "RQBIT_BIND_DEVICE")]
     bind_device_name: Option<String>,
+
+    /// Enable fail-closed VPN mode.
+    ///
+    /// Requires --bind-device. In this mode rqbit disables SOCKS proxy,
+    /// UPnP port forwarding, and local peer discovery, and stops the session
+    /// if watchdog checks fail.
+    #[arg(long = "vpn-lockdown", env = "RQBIT_VPN_LOCKDOWN")]
+    vpn_lockdown: bool,
+
+    /// Comma-separated list of allowed VPN exit CIDRs (for example
+    /// 203.0.113.0/24,198.51.100.0/24). Requires --vpn-lockdown and
+    /// --vpn-exit-ip-check-url.
+    #[arg(long = "vpn-allowed-exit-cidrs", env = "RQBIT_VPN_ALLOWED_EXIT_CIDRS")]
+    vpn_allowed_exit_cidrs: Option<String>,
+
+    /// URL that returns your public IP in plain text.
+    /// Requires --vpn-lockdown when set.
+    #[arg(long = "vpn-exit-ip-check-url", env = "RQBIT_VPN_EXIT_IP_CHECK_URL")]
+    vpn_exit_ip_check_url: Option<String>,
+
+    /// Interval for VPN watchdog checks, e.g. 30s.
+    #[arg(
+        long = "vpn-check-interval",
+        value_parser = parse_duration::parse,
+        env = "RQBIT_VPN_CHECK_INTERVAL"
+    )]
+    vpn_check_interval: Option<Duration>,
 
     /// Force IPv4 only.
     #[arg(long = "ipv4-only", env = "RQBIT_IPV4_ONLY")]
@@ -551,6 +584,17 @@ async fn async_main(mut opts: Opts, cancel: CancellationToken) -> anyhow::Result
         ipv4_only: opts.ipv4_only,
         ..Default::default()
     });
+    let vpn_allowed_exit_cidrs = opts
+        .vpn_allowed_exit_cidrs
+        .as_deref()
+        .map(|s| {
+            s.split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_owned)
+                .collect()
+        })
+        .unwrap_or_default();
 
     let mut sopts = SessionOptions {
         disable_dht: opts.disable_dht,
@@ -611,6 +655,10 @@ async fn async_main(mut opts: Opts, cancel: CancellationToken) -> anyhow::Result
         peer_limit: opts.peer_limit,
         runtime_worker_threads: Some(opts.max_blocking_threads as usize),
         ipv4_only: opts.ipv4_only,
+        vpn_lockdown: opts.vpn_lockdown,
+        vpn_allowed_exit_cidrs,
+        vpn_exit_ip_check_url: opts.vpn_exit_ip_check_url.take(),
+        vpn_check_interval: opts.vpn_check_interval,
     };
 
     #[allow(clippy::needless_update)]
@@ -640,6 +688,12 @@ async fn async_main(mut opts: Opts, cancel: CancellationToken) -> anyhow::Result
 
         ..Default::default()
     };
+
+    if opts.bind_device_name.is_some() && opts.enable_upnp_server {
+        bail!(
+            "--bind-device cannot be combined with --enable-upnp-server because UPnP media-server HTTP notifications are not interface-bound"
+        );
+    }
 
     match &opts.subcommand {
         SubCommand::Server(server_opts) => match &server_opts.subcommand {

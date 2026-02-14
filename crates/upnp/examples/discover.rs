@@ -1,6 +1,7 @@
 use std::time::Duration;
 
 use librqbit_upnp::{SSDP_SEARCH_ROOT_ST, discover_once, discover_services};
+use reqwest::Client;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -16,7 +17,7 @@ async fn main() -> anyhow::Result<()> {
         while let Some(r) = rx.recv().await {
             let stx = stx.clone();
             tokio::spawn(async move {
-                match discover_services(r.location.clone()).await {
+                match discover_services(r.location.clone(), &Client::new()).await {
                     Ok(s) => {
                         println!("{}: {s:#?}", r.location);
                     }
