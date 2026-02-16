@@ -403,7 +403,7 @@ impl UpnpPortForwarder {
             ports,
             opts: opts.unwrap_or_default(),
             bind_device,
-            http_client: http_client.unwrap_or_else(Client::new),
+            http_client: http_client.unwrap_or_default(),
         })
     }
 

@@ -360,6 +360,20 @@ pub struct HttpCreateTorrentOptions {
     #[serde(default)]
     trackers: Vec<String>,
     name: Option<String>,
+    piece_length_kib: Option<u32>,
+}
+
+fn piece_length_kib_to_bytes(
+    piece_length_kib: Option<u32>,
+) -> std::result::Result<Option<u32>, &'static str> {
+    match piece_length_kib {
+        None => Ok(None),
+        Some(0) => Err("piece_length_kib must be greater than 0"),
+        Some(kib) => kib
+            .checked_mul(1024)
+            .map(Some)
+            .ok_or("piece_length_kib is too large"),
+    }
 }
 
 pub async fn h_create_torrent(
@@ -379,11 +393,13 @@ pub async fn h_create_torrent(
         std::str::from_utf8(body.as_ref())
             .with_status_error(StatusCode::BAD_REQUEST, "invalid utf-8")?,
     );
+    let piece_length = piece_length_kib_to_bytes(opts.piece_length_kib)
+        .map_err(|msg| ApiError::from((StatusCode::BAD_REQUEST, msg)))?;
 
     let create_opts = CreateTorrentOptions {
         name: opts.name.as_deref(),
         trackers: opts.trackers,
-        piece_length: None,
+        piece_length,
     };
 
     let (torrent, handle) = state
@@ -428,5 +444,36 @@ pub async fn h_create_torrent(
 
             Ok((headers, torrent.as_bytes()?).into_response())
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::piece_length_kib_to_bytes;
+
+    #[test]
+    fn piece_length_kib_to_bytes_is_optional() {
+        assert_eq!(piece_length_kib_to_bytes(None).unwrap(), None);
+    }
+
+    #[test]
+    fn piece_length_kib_to_bytes_rejects_zero() {
+        let err = piece_length_kib_to_bytes(Some(0)).expect_err("expected zero validation");
+        assert_eq!(err, "piece_length_kib must be greater than 0");
+    }
+
+    #[test]
+    fn piece_length_kib_to_bytes_converts() {
+        assert_eq!(
+            piece_length_kib_to_bytes(Some(16_384)).unwrap(),
+            Some(16_384 * 1024)
+        );
+    }
+
+    #[test]
+    fn piece_length_kib_to_bytes_rejects_overflow() {
+        let err =
+            piece_length_kib_to_bytes(Some(u32::MAX)).expect_err("expected overflow validation");
+        assert_eq!(err, "piece_length_kib is too large");
     }
 }

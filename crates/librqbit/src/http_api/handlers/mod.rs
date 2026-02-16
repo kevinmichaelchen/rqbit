@@ -58,7 +58,7 @@ async fn h_api_root(parts: Parts) -> impl IntoResponse {
             "GET /torrents/{id_or_infohash}/stream/{file_idx}": "Stream a file. Accepts Range header to seek.",
             "GET /torrents/{id_or_infohash}/playlist": "Playlist for supported players",
             "POST /torrents": "Add a torrent here. magnet: or http:// or a local file.",
-            "POST /torrents/create": "Create a torrent and start seeding. Body should be a local folder",
+            "POST /torrents/create": "Create a torrent and start seeding. Body should be a local path. Query supports output=magnet|torrent, name, trackers (repeatable), piece_length_kib.",
             "POST /torrents/resolve_magnet": "Resolve a magnet to torrent file bytes",
             "POST /torrents/{id_or_infohash}/pause": "Pause torrent",
             "POST /torrents/{id_or_infohash}/start": "Resume torrent",

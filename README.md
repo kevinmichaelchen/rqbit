@@ -242,7 +242,7 @@ curl -s 'http://127.0.0.1:3030/'
     "GET /web/": "Web UI",
     "POST /rust_log": "Set RUST_LOG to this post launch (for debugging)",
     "POST /torrents": "Add a torrent here. magnet: or http:// or a local file.",
-    "POST /torrents/create": "Create a torrent and start seeding. Body should be a local folder",
+    "POST /torrents/create": "Create a torrent and start seeding. Body should be a local path. Query supports output=magnet|torrent, name, trackers (repeatable), piece_length_kib.",
     "POST /torrents/resolve_magnet": "Resolve a magnet to torrent file bytes",
     "POST /torrents/{id_or_infohash}/add_peers": "Add peers (newline-delimited)",
     "POST /torrents/{id_or_infohash}/delete": "Forget about the torrent, remove the files",
@@ -282,6 +282,41 @@ Supported query parameters, all optional:
 - only_files_regex - the regular expression string to match filenames
 - output_folder - the folder to download to. If not specified, defaults to the one that rqbit server started with
 - list_only=true|false - if you want to just list the files in the torrent instead of downloading
+
+### Create and seed a torrent through HTTP API
+
+Enable create first:
+
+```bash
+rqbit --http-api-allow-create server start /downloads
+```
+
+Create and start seeding, returning a `.torrent` file:
+
+```bash
+curl \
+  -X POST \
+  --data-binary '/path/to/release.tar.zst' \
+  'http://127.0.0.1:3030/torrents/create?output=torrent&name=natural_world_http_20260216&piece_length_kib=16384&trackers=https%3A%2F%2Facademictorrents.com%2Fannounce.php' \
+  -o release.torrent
+```
+
+Create and return a magnet instead:
+
+```bash
+curl \
+  -X POST \
+  --data-binary '/path/to/release.tar.zst' \
+  'http://127.0.0.1:3030/torrents/create?output=magnet&piece_length_kib=16384'
+```
+
+### Share CLI piece length
+
+`rqbit share` supports explicit piece size tuning:
+
+```bash
+rqbit share --piece-length-kib 16384 /path/to/release.tar.zst
+```
 
 ## Code organization
 

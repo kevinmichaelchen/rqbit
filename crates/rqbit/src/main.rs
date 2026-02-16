@@ -416,6 +416,13 @@ fn parse_initial_peers(s: &str) -> anyhow::Result<SocketAddrList> {
     Ok(SocketAddrList(v))
 }
 
+fn piece_length_kib_to_bytes(piece_length_kib: NonZeroU32) -> anyhow::Result<u32> {
+    piece_length_kib
+        .get()
+        .checked_mul(1024)
+        .context("piece length in KiB is too large")
+}
+
 #[derive(Parser)]
 struct CompletionsOpts {
     /// The shell to generate completions for
@@ -434,6 +441,10 @@ struct ShareOpts {
     /// Tracker URLs to share to (comma separated). Will append these to trackers from RQBIT_TRACKERS_FILENAME.
     #[arg(value_delimiter = ',', num_args = 0..32)]
     trackers: Vec<url::Url>,
+
+    /// Piece length in KiB (for example 8192 or 16384 for Academic Torrents).
+    #[arg(long = "piece-length-kib", env = "RQBIT_SHARE_PIECE_LENGTH_KIB")]
+    piece_length_kib: Option<NonZeroU32>,
 }
 
 #[derive(Parser)]
@@ -918,6 +929,10 @@ async fn async_main(mut opts: Opts, cancel: CancellationToken) -> anyhow::Result
                 .chain(share_opts.trackers.iter())
                 .map(|t| t.to_string())
                 .collect();
+            let piece_length = share_opts
+                .piece_length_kib
+                .map(piece_length_kib_to_bytes)
+                .transpose()?;
 
             let session = Session::new_with_opts(PathBuf::new(), sopts)
                 .await
@@ -940,7 +955,7 @@ async fn async_main(mut opts: Opts, cancel: CancellationToken) -> anyhow::Result
                     CreateTorrentOptions {
                         name: share_opts.name.as_deref(),
                         trackers,
-                        ..Default::default()
+                        piece_length,
                     },
                 )
                 .await
@@ -1085,6 +1100,23 @@ fn spawn_stats_printer(session: Arc<Session>) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn piece_length_kib_to_bytes_converts() {
+        use crate::piece_length_kib_to_bytes;
+
+        let bytes = piece_length_kib_to_bytes(std::num::NonZeroU32::new(8192).unwrap()).unwrap();
+        assert_eq!(bytes, 8 * 1024 * 1024);
+    }
+
+    #[test]
+    fn piece_length_kib_to_bytes_rejects_overflow() {
+        use crate::piece_length_kib_to_bytes;
+
+        let err = piece_length_kib_to_bytes(std::num::NonZeroU32::new(u32::MAX).unwrap())
+            .expect_err("expected overflow");
+        assert!(err.to_string().contains("too large"));
+    }
+
     #[cfg(not(target_os = "windows"))]
     #[test]
     fn test_parse_umask() {
